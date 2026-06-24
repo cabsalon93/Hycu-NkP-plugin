@@ -3164,23 +3164,46 @@ LOGO_PLACEHOLDER = (
     '</svg>')
 
 
+def _scan_brand_logo(d):
+    """Repère un asset de marque déposé tel quel dans `d` (ex.
+    « HYCU_Logomark_HYCUPurple_RGB.svg ») : fichier image dont le nom commence par
+    « hycu » et contient « logo »/« logomark ». Priorité au vectoriel (.svg) puis au
+    nom le plus court. Renvoie un chemin ou None."""
+    try:
+        names = os.listdir(d)
+    except Exception:
+        return None
+    cands = []
+    for n in names:
+        ext = os.path.splitext(n)[1].lower()
+        low = n.lower()
+        if ext in LOGO_MIME and low.startswith("hycu") and ("logo" in low):
+            cands.append(n)
+    cands.sort(key=lambda n: (0 if n.lower().endswith(".svg") else 1, len(n), n.lower()))
+    return os.path.join(d, cands[0]) if cands else None
+
+
 def _find_logo_file():
-    """Localise un fichier logo local : CONFIG['logo_path'] explicite, sinon hycu_logo.*
-    dans le répertoire courant, sinon à côté du script. Renvoie un chemin ou None."""
-    cand = []
+    """Localise un fichier logo local : 1) CONFIG['logo_path'] explicite ; 2) hycu_logo.*
+    ; 3) un asset de marque déposé tel quel (HYCU…logo….svg/png). Cherche dans le
+    répertoire courant puis à côté du script. Renvoie un chemin ou None."""
     cfg = (CONFIG.get("logo_path") or "").strip()
-    if cfg:
-        cand.append(cfg)
+    if cfg and os.path.isfile(cfg):
+        return cfg
     here = os.path.dirname(os.path.abspath(__file__))
-    for base in LOGO_BASENAMES:
-        cand.append(os.path.join(os.getcwd(), base))
-        cand.append(os.path.join(here, base))
-    for p in cand:
-        try:
-            if p and os.path.isfile(p):
-                return p
-        except Exception:
-            pass
+    dirs = [os.getcwd(), here]
+    for d in dirs:                                   # 2) noms explicites hycu_logo.*
+        for base in LOGO_BASENAMES:
+            p = os.path.join(d, base)
+            try:
+                if os.path.isfile(p):
+                    return p
+            except Exception:
+                pass
+    for d in dirs:                                   # 3) asset de marque officiel
+        p = _scan_brand_logo(d)
+        if p:
+            return p
     return None
 
 
