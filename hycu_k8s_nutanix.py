@@ -126,6 +126,7 @@ DEFAULT_CONFIG = {
     "retain_source_pv": True,
     "require_context_confirm": True,  # exiger la confirmation du contexte avant action réelle
     "open_browser": True,
+    "logo_path": "",                  # chemin explicite d'un logo (sinon hycu_logo.* à côté du programme)
     "remember_credentials": False,    # True = un coffre chiffré hycu_secrets.enc existe
     "pbkdf2_iterations": 200000,      # itérations PBKDF2 pour la phrase secrète
     # ---- Connecteurs HYCU / Nutanix (endpoints NON secrets ; identifiants en RAM) ----
@@ -3046,7 +3047,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = parsed.path
         qs = {k: v[0] for k, v in urllib.parse.parse_qs(parsed.query).items()}
         if path == "/":
-            return self._send(200, HTML.replace("__CSRF_TOKEN__", CSRF_TOKEN).replace("__VERSION__", VERSION), "text/html")
+            return self._send(200, HTML.replace("__CSRF_TOKEN__", CSRF_TOKEN)
+                              .replace("__VERSION__", VERSION).replace("__LOGO__", _logo_markup()), "text/html")
         try:
             if path == "/api/context":
                 return self._json(action_context())
@@ -3141,6 +3143,66 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 # ------------------------------------------------------------------------------
+# Logo embarqué (offline / site isolé) : si un fichier hycu_logo.* est présent à
+# côté du programme (ou via CONFIG["logo_path"]), il est INLINÉ en data-URI base64
+# dans la page — aucune requête réseau (fonctionne en dark site). À défaut, un repère
+# neutre est affiché (ce N'EST PAS le logo officiel HYCU : déposez votre fichier).
+# ------------------------------------------------------------------------------
+LOGO_BASENAMES = ("hycu_logo.svg", "hycu_logo.png", "hycu_logo.webp",
+                  "hycu_logo.jpg", "hycu_logo.jpeg", "hycu_logo.gif")
+LOGO_MIME = {".svg": "image/svg+xml", ".png": "image/png", ".webp": "image/webp",
+             ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif"}
+LOGO_MAX_BYTES = 512 * 1024
+
+# Repère neutre par défaut (générique, pas la marque officielle).
+LOGO_PLACEHOLDER = (
+    '<svg class="logo" width="38" height="38" viewBox="0 0 38 38" role="img" aria-label="HYCU">'
+    '<rect x="1" y="1" width="36" height="36" rx="9" fill="#43128E"></rect>'
+    '<path d="M19 8 L28 11 V19 C28 24.5 24 28.5 19 30.5 C14 28.5 10 24.5 10 19 V11 Z" fill="#ADFF00"></path>'
+    '<path d="M14.7 18.6 l3 3 l6.6 -7.6" fill="none" stroke="#1B0C33" stroke-width="2.6"'
+    ' stroke-linecap="round" stroke-linejoin="round"></path>'
+    '</svg>')
+
+
+def _find_logo_file():
+    """Localise un fichier logo local : CONFIG['logo_path'] explicite, sinon hycu_logo.*
+    dans le répertoire courant, sinon à côté du script. Renvoie un chemin ou None."""
+    cand = []
+    cfg = (CONFIG.get("logo_path") or "").strip()
+    if cfg:
+        cand.append(cfg)
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in LOGO_BASENAMES:
+        cand.append(os.path.join(os.getcwd(), base))
+        cand.append(os.path.join(here, base))
+    for p in cand:
+        try:
+            if p and os.path.isfile(p):
+                return p
+        except Exception:
+            pass
+    return None
+
+
+def _logo_markup():
+    """Markup du logo pour l'en-tête : <img> en data-URI base64 si un fichier local
+    existe (embarqué -> hors-ligne), sinon le repère neutre par défaut."""
+    p = _find_logo_file()
+    if not p:
+        return LOGO_PLACEHOLDER
+    try:
+        if os.path.getsize(p) > LOGO_MAX_BYTES:
+            return LOGO_PLACEHOLDER                       # garde-fou : logo déraisonnable
+        with open(p, "rb") as f:
+            raw = f.read()
+        mime = LOGO_MIME.get(os.path.splitext(p)[1].lower(), "application/octet-stream")
+        uri = "data:%s;base64,%s" % (mime, base64.b64encode(raw).decode("ascii"))
+        return '<img class="logo" src="%s" alt="HYCU" />' % uri
+    except Exception:
+        return LOGO_PLACEHOLDER
+
+
+# ------------------------------------------------------------------------------
 # Interface (HTML + CSS + JS, un seul bloc, vanilla)
 # ------------------------------------------------------------------------------
 HTML = r"""<!DOCTYPE html>
@@ -3173,7 +3235,7 @@ HTML = r"""<!DOCTYPE html>
   header h1 small{display:block;font-size:11px;color:#B8B4FC;font-weight:400;
                   text-transform:uppercase;letter-spacing:1.5px;margin-top:3px}
   .brand{display:flex;align-items:center;gap:13px}
-  .logo{flex:none;display:block}
+  .logo{flex:none;display:block;height:38px;width:auto;max-width:180px}
   .wm{color:var(--accent);font-weight:800;letter-spacing:2px;margin-right:8px}
   .ctx{font-size:12px;color:#E9E6FF;font-weight:600}
   .ver{font-family:ui-monospace,Consolas,monospace;font-size:11px;color:#C9C4FF;font-weight:600;opacity:.85}
@@ -3399,11 +3461,7 @@ HTML = r"""<!DOCTYPE html>
 
 <header>
   <div class="brand">
-    <svg class="logo" width="38" height="38" viewBox="0 0 38 38" role="img" aria-label="HYCU">
-      <rect x="1" y="1" width="36" height="36" rx="9" fill="#43128E"></rect>
-      <path d="M19 8 L28 11 V19 C28 24.5 24 28.5 19 30.5 C14 28.5 10 24.5 10 19 V11 Z" fill="#ADFF00"></path>
-      <path d="M14.7 18.6 l3 3 l6.6 -7.6" fill="none" stroke="#1B0C33" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"></path>
-    </svg>
+    __LOGO__
     <h1><span class="wm">HYCU</span>Protection Kubernetes sur Nutanix<small>Sauvegarde &amp; restauration guidées · Nutanix</small></h1>
   </div>
   <div class="ctx">Contexte kubectl : <b id="ctx">…</b><span id="ctxWarn"></span> · <span class="ver" title="Version de la build">v:__VERSION__</span></div>
