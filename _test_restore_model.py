@@ -106,6 +106,31 @@ custom["spec"]["csi"]["volumeHandle"] = "AcmeCSI-" + OLD_VG_UUID
 built8, _ = H.build_new_pv(custom, NEW_VG_UUID, "z", "clone")
 check(built8["manifest"]["spec"]["csi"]["volumeHandle"] == "AcmeCSI-" + NEW_VG_UUID, "préfixe 'AcmeCSI-' conservé")
 
+print("\n== 9. Legacy iSCSI SANS spec.csi.volumeHandle : réf = UUID nu du nouveau VG (V3) ==")
+# Un vrai PV iSCSI hérité n'a PAS de csi.volumeHandle ; l'identité du VG vit dans l'IQN.
+# analyse_pv doit prendre l'UUID DANS l'IQN (pas l'UUID « pvc-<uuid> » du nom de PV),
+# sinon la réécriture laisse le nouveau PV pointer vers le VG SOURCE.
+legacy_iscsi = {
+    "apiVersion": "v1", "kind": "PersistentVolume",
+    "metadata": {"name": "pvc-" + PVC_UUID},
+    "spec": {
+        "accessModes": ["ReadWriteOnce"], "capacity": {"storage": "8Gi"},
+        "claimRef": {"kind": "PersistentVolumeClaim", "name": "mariadb-pvc", "namespace": "wordpress"},
+        "iscsi": {"targetPortal": "10.10.0.5:3260", "lun": 0, "fsType": "ext4",
+                  "iqn": "iqn.2010-06.com.nutanix:ntnx-k8s-" + OLD_VG_UUID + "-98765-tgt0"},
+        "persistentVolumeReclaimPolicy": "Delete",
+    },
+}
+info9 = H.analyse_pv(legacy_iscsi)
+check(H.split_volume_handle(info9["old_volume_handle"] or "")[1] == OLD_VG_UUID,
+      "analyse_pv extrait l'UUID du VG depuis l'IQN (pas l'UUID du nom de PV)")
+built9, err9 = H.build_new_pv(legacy_iscsi, NEW_VG_UUID, "pvc-legacy-0000", "clone")
+check(err9 is None, "pas d'erreur")
+blob9 = json.dumps(built9["manifest"])
+check(OLD_VG_UUID not in blob9, "UUID du VG SOURCE absent du PV reconstruit (plus de pointage vers le VG source)")
+check(("ntnx-k8s-" + NEW_VG_UUID) in blob9, "IQN réécrit avec l'UUID du NOUVEAU VG")
+check(built9["same_uuid"] is False and built9["looks_like_vg_name"] is False, "gardes anti-confusion OK")
+
 print("\n----------------------------------------")
 print("RÉSULTAT : %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)

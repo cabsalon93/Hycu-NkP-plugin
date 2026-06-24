@@ -477,9 +477,18 @@ def analyse_pv(pv_dict):
     if isinstance(csi, dict) and isinstance(csi.get("volumeHandle"), str):
         vh = csi["volumeHandle"]
     if vh is None:
-        # repli : on cherche un handle de la forme <préfixe><uuid> n'importe où
-        m = re.search(r"[A-Za-z0-9_]+-" + UUID_RE.pattern, text)
-        vh = m.group(0) if m else None
+        # Repli pour PV iSCSI hérité (sans spec.csi.volumeHandle) : l'IDENTITÉ du VG est
+        # l'UUID porté par l'IQN (« iqn.…:…ntnx-k8s-<uuid-du-VG>… »). On la prend de
+        # l'IQN — JAMAIS du repli textuel générique, qui matcherait d'abord le NOM du PV
+        # « pvc-<uuid-du-PVC> » (metadata sérialisée avant spec) et figerait le mauvais
+        # UUID, laissant le nouveau PV pointer vers le VG SOURCE.
+        iqn_uuid = UUID_RE.search(iqn.group(0)) if iqn else None
+        if iqn_uuid:
+            prefix = CONFIG.get("volume_handle_prefix") or "NutanixVolumes-"
+            vh = prefix + iqn_uuid.group(0)
+        else:
+            m = re.search(r"[A-Za-z0-9_]+-" + UUID_RE.pattern, text)
+            vh = m.group(0) if m else None
     prefix, _ = split_volume_handle(vh or "")
     return {
         "name": (pv_dict.get("metadata") or {}).get("name"),
@@ -592,7 +601,10 @@ def build_new_pv(old_pv, new_ref, new_name, mode):
     # Garde anti-confusion : le NOM du VG côté Nutanix est « pvc-<uuid-du-PVC> » — un
     # UUID DIFFÉRENT de l'UUID du VG. Si la réf saisie correspond à l'UUID du nom du PV,
     # l'utilisateur a probablement collé le NOM du VG au lieu de son UUID.
-    pvc_uuid = split_volume_handle(old_name or "")[1]
+    # NB : on lit le nom ORIGINAL (old_pv), pas new_pv déjà passé par _replace_in_leaves,
+    # sinon un nom réécrit fausserait le diagnostic.
+    orig_pv_name = (old_pv.get("metadata") or {}).get("name")
+    pvc_uuid = split_volume_handle(orig_pv_name or "")[1]
     looks_like_vg_name = bool(new_uuid and pvc_uuid and new_uuid == pvc_uuid)
     return {"manifest": new_pv, "new_name": new_name, "new_volume_handle": new_vh,
             "old_volume_handle": info["old_volume_handle"], "old_iqn": info["old_iqn"],
@@ -1186,6 +1198,22 @@ def _plan_steps(ns, prepared, mode):
 # ------------------------------------------------------------------------------
 # Exécution transactionnelle du restore (multi-PVC, arrêt sur échec)
 # ------------------------------------------------------------------------------
+def _context_guard(payload):
+    """Garde contexte (mode réel) commune aux trois orchestrateurs destructifs :
+    refuse un contexte kubectl hors `allowed_contexts`, ou non reconfirmé quand
+    `require_context_confirm` est actif. Le frontend n'étant que consultatif, cette
+    vérification côté serveur est la vraie frontière. Renvoie un dict d'erreur prêt à
+    retourner, ou None si le contexte est autorisé et confirmé."""
+    cinfo = action_context()
+    if not cinfo["context_ok"]:
+        return {"ok": False, "error": "Contexte kubectl « %s » non autorisé par la configuration "
+                "(allowed_contexts)." % cinfo.get("context"), "log": []}
+    if cinfo["require_confirm"] and payload.get("confirm_context") != cinfo.get("context"):
+        return {"ok": False, "error": "Confirmation du contexte requise : retapez le nom du contexte ciblé "
+                "(« %s ») pour confirmer." % cinfo.get("context"), "log": []}
+    return None
+
+
 def action_execute_restore(payload, log=None):
     """Exécute la séquence de restore pour un ou plusieurs PVC en une transaction.
     - un seul scale-down / scale-up encadrant tous les volumes ;
@@ -1210,21 +1238,24 @@ def _execute_restore_locked(payload, log=None):
 
     # Garde contexte : en mode réel, refuser si le contexte n'est pas confirmé/autorisé.
     if not dry:
-        cinfo = action_context()
-        if not cinfo["context_ok"]:
-            return {"ok": False, "error": "Contexte kubectl « %s » non autorisé par la configuration "
-                    "(allowed_contexts)." % cinfo.get("context"), "log": []}
-        if cinfo["require_confirm"] and payload.get("confirm_context") != cinfo.get("context"):
-            return {"ok": False, "error": "Confirmation du contexte requise : retapez le nom du contexte ciblé "
-                    "(« %s ») pour confirmer." % cinfo.get("context"), "log": []}
+        guard = _context_guard(payload)
+        if guard:
+            return guard
 
-    prep = action_prepare_restore({**payload, "dry": dry})
+    # Reprise idempotente : charger une éventuelle transaction en cours AVANT la
+    # préparation. En reprise, le PVC/PV source a déjà été supprimé du cluster — les
+    # manifestes doivent être relus depuis la sauvegarde de sécurité initiale
+    # (txn["backup_dir"]), sinon _prepare_one ne retrouve rien en live et la reprise
+    # échoue définitivement (app laissée à 0 réplica, PV/PVC absents).
+    txn = _load_txn(ns) if not dry else None
+    backup_path = payload.get("backup_path") or (txn or {}).get("backup_dir")
+
+    prep = action_prepare_restore({**payload, "backup_path": backup_path, "dry": dry})
     if not prep.get("ok"):
         return {"ok": False, "error": prep.get("error"), "log": [],
                 "results": prep.get("results")}
 
     prepared = [r for r in prep["results"] if r.get("ok")]
-    backup_path = payload.get("backup_path")
     aborted = False
     abort_detail = ""
 
@@ -1238,7 +1269,6 @@ def _execute_restore_locked(payload, log=None):
     #    initiale (ne pas re-sauvegarder un état à moitié restauré) — les étapes sont
     #    idempotentes (delete d'un absent = ok, apply = upsert).
     if not dry:
-        txn = _load_txn(ns)
         if txn:
             log.append(logentry("Reprise d'une restauration interrompue",
                                 stdout="Démarrée %s (mode %s). Sauvegarde de sécurité initiale réutilisée ; "
@@ -1495,9 +1525,33 @@ def _auth_header(auth):
     return "Basic " + token
 
 
+class _NoCredLeakRedirect(urllib.request.HTTPRedirectHandler):
+    """Suit les redirections HTTP mais RETIRE l'en-tête Authorization si l'hôte cible
+    change : évite de réémettre les identifiants HYCU/Nutanix (Basic/Bearer) vers un
+    hôte tiers si une appliance compromise — ou un MITM (TLS souvent désactivé) —
+    renvoie un 30x cross-host."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        newreq = urllib.request.HTTPRedirectHandler.redirect_request(
+            self, req, fp, code, msg, headers, newurl)
+        if newreq is not None:
+            try:
+                same = (urllib.parse.urlsplit(req.full_url).netloc
+                        == urllib.parse.urlsplit(newurl).netloc)
+            except Exception:
+                same = False
+            if not same:
+                newreq.headers.pop("Authorization", None)
+                newreq.unredirected_hdrs.pop("Authorization", None)
+        return newreq
+
+
 def _http_json(method, url, auth, verify, body=None, timeout=30):
     """Appel REST générique (Basic Auth ou clé API + JSON). Renvoie un dict de
     résultat homogène, sans jamais lever d'exception vers l'appelant."""
+    scheme = urllib.parse.urlsplit(url).scheme.lower()
+    if scheme not in ("https", "http"):
+        return {"ok": False, "status": None,
+                "error": "Schéma d'URL refusé (%s) : seuls http/https sont autorisés." % (scheme or "—")}
     data = json.dumps(body).encode("utf-8") if body is not None else None
     req = urllib.request.Request(url, data=data, method=method)
     h = _auth_header(auth)
@@ -1507,7 +1561,10 @@ def _http_json(method, url, auth, verify, body=None, timeout=30):
     if data is not None:
         req.add_header("Content-Type", "application/json")
     try:
-        with urllib.request.urlopen(req, context=_ssl_ctx(verify), timeout=timeout) as r:
+        opener = urllib.request.build_opener(
+            _NoCredLeakRedirect(),
+            urllib.request.HTTPSHandler(context=_ssl_ctx(verify)))
+        with opener.open(req, timeout=timeout) as r:
             raw = r.read().decode("utf-8", "ignore")
             parsed = None
             if raw:
@@ -1958,7 +2015,9 @@ def _clone_vg_disk_uuids(vg_uuid):
     if not r.get("ok"):
         return None
     data = (r.get("json") or {}).get("data") or []
-    ids = [d.get("extId") for d in data if d.get("extId")]
+    # Tri pour un ordre canonique : l'API v4 ne garantit pas l'ordre des extId ; sans
+    # tri, un VG multi-disques paraîtrait « changé » sur un simple ré-ordonnancement.
+    ids = sorted(d.get("extId") for d in data if d.get("extId"))
     return ",".join(ids) if ids else None
 
 
@@ -2028,7 +2087,11 @@ def _refresh_pv_disk(ns, pvc_name, dry, log):
                                    "Prism Central et relancez la restauration sur place."))
         return True, ""                                  # non bloquant (HYCU n'a peut-être pas changé le disque)
     new_disk = _clone_vg_disk_uuids(vg_uuid)
-    if not new_disk or new_disk == (old_disk or ""):
+    # Comparaison indépendante de l'ordre : un VG multi-disques ne doit pas être vu
+    # comme « changé » sur un simple ré-ordonnancement des extId renvoyés par l'API v4.
+    def _disk_set(s):
+        return frozenset(x for x in (s or "").split(",") if x)
+    if not new_disk or _disk_set(new_disk) == _disk_set(old_disk):
         return True, ""                                  # disque inchangé -> rien à faire
     log.append(logentry("Disque du VG remplacé par le restore in-place — rafraîchissement du PV %s" % pv_name,
                         stdout="hypervisorAttachedDiskUUIDs : %s -> %s" % (old_disk, new_disk)))
@@ -2039,15 +2102,30 @@ def _refresh_pv_disk(ns, pvc_name, dry, log):
     new_pv = clean_pv(json.loads(json.dumps(pv_live)))
     new_pv.setdefault("spec", {}).setdefault("csi", {}).setdefault("volumeAttributes", {})[
         "hypervisorAttachedDiskUUIDs"] = new_disk
+    # Filet de sécurité : le PV recréé est forcé en Retain pour qu'une suppression
+    # ULTÉRIEURE (autre échec, nettoyage opérateur, teardown de namespace) ne détruise
+    # PAS le Volume Group restauré (reclaimPolicy=Delete par défaut côté Nutanix). Sans
+    # cela, new_pv hériterait de la politique d'origine du PV live (souvent Delete).
+    new_pv.setdefault("spec", {})["persistentVolumeReclaimPolicy"] = "Retain"
     pvc_manifest = clean_pvc(json.loads(json.dumps(pvc_live)))
-    st_pv, _ = resource_state("pv", pv_name)
-    if st_pv == "present":                               # Retain : ne pas supprimer le VG en supprimant le PV
-        pr = kubectl(["patch", "pv", pv_name, "--type=merge",
-                      "-p", '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'],
-                     dry=False, label="Protection du VG : PV %s -> Retain" % pv_name)
-        log.append(pr)
-        if not pr["ok"]:
-            return False, "protection (Retain) du PV %s" % pv_name
+    # Retain AVANT suppression : on ne supprime le PV QUE si son état est CERTAIN.
+    # resource_state ne renvoie jamais "present" sur erreur kubectl transitoire (RBAC,
+    # réseau, timeout API-server) ; dans le doute on AVORTE plutôt que de supprimer un
+    # PV peut-être en politique Delete (sinon le CSI supprimerait le VG -> perte du
+    # volume tout juste restauré in-place).
+    st_pv, st_err = resource_state("pv", pv_name)
+    if st_pv != "present":
+        log.append(logentry("Rafraîchissement du PV %s annulé : état du PV indéterminé (%s)" % (pv_name, st_pv),
+                            ok=False, rc=-1,
+                            stderr=(st_err or "") + " — suppression refusée pour ne pas risquer la perte du "
+                                   "Volume Group. Vérifiez l'accès kubectl puis relancez."))
+        return False, "vérification de l'état du PV %s avant suppression" % pv_name
+    pr = kubectl(["patch", "pv", pv_name, "--type=merge",
+                  "-p", '{"spec":{"persistentVolumeReclaimPolicy":"Retain"}}'],
+                 dry=False, label="Protection du VG : PV %s -> Retain" % pv_name)
+    log.append(pr)
+    if not pr["ok"]:
+        return False, "protection (Retain) du PV %s" % pv_name
     if not _delete_and_unblock("pvc", pvc_name, ns, log):
         return False, "suppression du PVC %s" % pvc_name
     if not _delete_and_unblock("pv", pv_name, None, log):
@@ -2439,6 +2517,13 @@ def action_orchestrate_inplace(payload, log=None):
     if stale:
         return _err(stale, log=[])
 
+    # Garde contexte (mode réel) : ne pas déclencher un vgrestore in-place destructif
+    # (qui ÉCRASE les données du volume live) sur un contexte non autorisé/non reconfirmé.
+    if not dry:
+        guard = _context_guard(payload)
+        if guard:
+            return guard
+
     acquired = False
     if not dry:
         if not ACTION_LOCK.acquire(blocking=False):
@@ -2693,12 +2778,21 @@ def action_clone_app(payload, log=None):
     items = payload.get("items") or []
     if not _namespace_allowed(ns):
         return {"ok": False, "error": "Namespace '%s' non autorisé." % ns, "log": []}
+    if not _namespace_allowed(target_ns):
+        return {"ok": False, "error": "Namespace cible '%s' non autorisé par la configuration "
+                "(namespace_filter)." % target_ns, "log": []}
     if same_ns and not suffix:
         return {"ok": False, "error": "Un suffixe est requis pour cloner dans le même namespace.", "log": []}
     if not K8S_NAME_RE.match(target_ns):
         return {"ok": False, "error": "Nom de namespace cible invalide : '%s'." % target_ns, "log": []}
     if not items:
         return {"ok": False, "error": "Aucun volume sélectionné.", "log": []}
+    # Garde contexte (mode réel) : appliquer des manifestes (PV/PVC/workloads/Secrets)
+    # sur le cluster courant exige un contexte autorisé/reconfirmé, comme la restauration.
+    if not dry:
+        guard = _context_guard(payload)
+        if guard:
+            return guard
 
     prepared, pvc_rename = [], {}
     for it in items:
@@ -2713,6 +2807,16 @@ def action_clone_app(payload, log=None):
         built, err = build_new_pv(old_pv, new_ref, (it.get("new_name") or "").strip(), "clone")
         if err:
             return {"ok": False, "error": "%s : %s" % (pvc_name, err), "log": []}
+        # Garde anti-confusion (comme la prévisualisation du restore) : refuser si la réf
+        # est l'UUID du VG SOURCE (le clone pointerait vers le MÊME disque que l'app
+        # d'origine -> multi-attach/corruption) ou le NOM du VG au lieu de son UUID.
+        if built.get("same_uuid"):
+            return {"ok": False, "error": "« %s » : la référence est identique au volume SOURCE — le clone "
+                    "pointerait vers le même disque Nutanix que l'application d'origine (risque de "
+                    "multi-attach/corruption). Collez l'UUID du VG CLONÉ." % pvc_name, "log": []}
+        if built.get("looks_like_vg_name"):
+            return {"ok": False, "error": "« %s » : la référence correspond au NOM du Volume Group "
+                    "(« pvc-<uuid-du-PVC> ») et non à son UUID. Collez l'UUID du VG cloné." % pvc_name, "log": []}
         src_pvc = _load_backup_pvc(backup_path, pvc_name)
         if src_pvc is None:
             live, _ = kubectl_json(["get", "pvc", pvc_name, "-n", ns])
@@ -4172,12 +4276,21 @@ $("#rsInplaceRun").onclick=async()=>{
   const items=chosen.filter(p=>rsInplaceSel[p]).map(p=>({pvc:p, source_vg_uuid:rsInplaceSel[p].source_vg_uuid, restore_point_id:rsInplaceSel[p].restore_point_id}));
   if(!items.length) return;
   const live=!dry();
-  if(live && !(await confirmDanger({title:"Restauration SUR PLACE RÉELLE", lines:[
-     "Namespace : <b>"+esc((rsHyMatch?rsHyMatch.ns:$("#rsNs").value)||"?")+"</b>",
-     "L'application sera <b>ARRÊTÉE</b>, les volumes restaurés <b>in-place</b> dans HYCU (données écrasées par le point choisi), puis l'application <b>REDÉMARRÉE</b>."]}))) return;
+  let confirmedCtx="";
+  if(live){
+    const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+    const res = await confirmDanger({title:"Restauration SUR PLACE RÉELLE", requireText:needCtx, lines:[
+       "Namespace : <b>"+esc((rsHyMatch?rsHyMatch.ns:$("#rsNs").value)||"?")+"</b>",
+       "Contexte kubectl : <b>"+esc(ctxInfo.context||"?")+"</b>",
+       "L'application sera <b>ARRÊTÉE</b>, les volumes restaurés <b>in-place</b> dans HYCU (données écrasées par le point choisi), puis l'application <b>REDÉMARRÉE</b>."]});
+    if(!res) return;
+    if(typeof res==="string") confirmedCtx=res;
+  }
   const b=$("#rsInplaceRun"); b.disabled=true; b.innerHTML='<span class="spin"></span>Orchestration…';
   $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Démarrage…</div>';
-  const r=await runOp("/api/orchestrate/inplace",{namespace:(rsHyMatch?rsHyMatch.ns:$("#rsNs").value), items, dry:dry()},
+  const ipBody={namespace:(rsHyMatch?rsHyMatch.ns:$("#rsNs").value), items, dry:dry()};
+  if(live && ctxInfo.require_confirm) ipBody.confirm_context=confirmedCtx;
+  const r=await runOp("/api/orchestrate/inplace", ipBody,
     log=>{ $("#rsInplaceLog").innerHTML='<div class="hint"><span class="spin"></span> Orchestration en cours…</div>'+renderLog(log); });
   b.disabled=false; b.textContent="Lancer la restauration sur place";
   if(r.error && !(r.log&&r.log.length)){ $("#rsInplaceLog").innerHTML=errBox(r.error); return; }
@@ -4290,12 +4403,21 @@ $("#dry").addEventListener("change",()=>{ if($("#rsPlan").style.display!=="none"
 $("#rsGo").onclick=async()=>{
   const live=!dry();
   if(state.preview && state.preview._cloneapp){
-    if(live && !(await confirmDanger({title:"Clone d'application RÉEL", lines:[
-       "Une <b>COPIE</b> de l'application sera créée"+(state.cloneNsMode==="same"?" dans le <b>même namespace</b> (avec suffixe)":" dans le namespace cible <b>"+esc($("#rsCloneTargetNs").value||"?")+"</b>")+".",
-       "L'application d'origine n'est <b>PAS</b> modifiée ni arrêtée."]}))) return;
+    let confirmedCtxCA="";
+    if(live){
+      const needCtx = ctxInfo.require_confirm ? (ctxInfo.context||"") : null;
+      const res = await confirmDanger({title:"Clone d'application RÉEL", requireText:needCtx, lines:[
+         "Une <b>COPIE</b> de l'application sera créée"+(state.cloneNsMode==="same"?" dans le <b>même namespace</b> (avec suffixe)":" dans le namespace cible <b>"+esc($("#rsCloneTargetNs").value||"?")+"</b>")+".",
+         "Contexte kubectl : <b>"+esc(ctxInfo.context||"?")+"</b>",
+         "L'application d'origine n'est <b>PAS</b> modifiée ni arrêtée."]});
+      if(!res) return;
+      if(typeof res==="string") confirmedCtxCA=res;
+    }
     const bb=$("#rsGo"); bb.disabled=true; bb.innerHTML='<span class="spin"></span>…';
     $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Démarrage…</div>';
-    const r=await runOp("/api/clone_app",{...cloneAppBody(), dry:dry()},
+    const caBody={...cloneAppBody(), dry:dry()};
+    if(live && ctxInfo.require_confirm) caBody.confirm_context=confirmedCtxCA;
+    const r=await runOp("/api/clone_app", caBody,
       log=>{ $("#rsLog").innerHTML='<div class="hint"><span class="spin"></span> Clonage en cours…</div>'+renderLog(log); });
     bb.disabled=false; updateGoButton(true);
     if(r.error && !(r.log&&r.log.length)){ $("#rsLog").innerHTML=errBox(r.error); return; }

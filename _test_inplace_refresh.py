@@ -46,6 +46,8 @@ check(len(pv_applied) == 1, "le PV est recréé")
 check(pv_applied and pv_applied[0]["spec"]["csi"]["volumeAttributes"]["hypervisorAttachedDiskUUIDs"] == NEW,
       "hypervisorAttachedDiskUUIDs = nouveau disque")
 check(pv_applied and pv_applied[0]["spec"]["csi"]["volumeHandle"] == "NutanixVolumes-" + VG, "même volumeHandle (même VG)")
+check(pv_applied and pv_applied[0]["spec"].get("persistentVolumeReclaimPolicy") == "Retain",
+      "PV recréé forcé en Retain (V10 : ne pas réarmer la destruction du VG)")
 
 print("\n== 2. Disque INCHANGÉ -> no-op ==")
 H._clone_vg_disk_uuids = lambda u: OLD
@@ -66,6 +68,21 @@ H.SESSION_CREDS["prismcentral"] = {"mode": "basic"}
 applied.clear(); log4 = []
 ok4, _ = H._refresh_pv_disk("wordpress", "mariadb-pvc", dry=True, log=log4)
 check(ok4 is True and not applied, "dry : aucun apply destructif")
+
+print("\n== 5. État du PV INCERTAIN (erreur kubectl) -> AVORTE sans rien supprimer (V1) ==")
+H._clone_vg_disk_uuids = lambda u: NEW
+H.resource_state = lambda kind, name, ns=None: ("error", "Unable to connect to the server")
+deleted = []
+_orig_del = H._delete_and_unblock
+H._delete_and_unblock = lambda kind, name, ns, log: (deleted.append((kind, name)), True)[1]
+applied.clear(); log5 = []
+ok5, detail5 = H._refresh_pv_disk("wordpress", "mariadb-pvc", dry=False, log=log5)
+H._delete_and_unblock = _orig_del
+H.resource_state = lambda kind, name, ns=None: ("present", "")
+check(ok5 is False, "retourne un échec si l'état du PV est indéterminé")
+check(not deleted, "AUCUNE suppression PVC/PV (le VG ne peut pas être détruit par erreur)")
+check(not applied, "aucune recréation de PV")
+check("état du PV" in (detail5 or "") or "vérification" in (detail5 or ""), "détail d'échec explicite")
 
 print("\nRÉSULTAT : %d OK, %d FAIL" % (passed, failed))
 raise SystemExit(1 if failed else 0)
