@@ -177,7 +177,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1130"
+VERSION = "20260625-1138"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -3432,6 +3432,9 @@ HTML = r"""<!DOCTYPE html>
   .rsAdv{margin-top:8px;border:1px solid var(--line);border-radius:8px;background:#faf9fc;padding:6px 10px}
   .rsAdvSum{cursor:pointer;font-weight:600;font-size:13px;color:#5a4b86;user-select:none}
   .rsAdv[open] .rsAdvSum{margin-bottom:8px}
+  .rsManualPlain{border:none;background:none;padding:0}
+  .rsManualPlain > .rsAdvSum{display:none}
+  .rsGuide{margin:0 0 10px;padding:8px 12px;border-left:3px solid var(--accent);background:#f3f0fb;border-radius:6px;font-size:13px}
   .badge{font-size:10px;padding:2px 8px;border-radius:20px;text-transform:uppercase;letter-spacing:.5px}
   .b-bound{background:#eefcc4;color:#4f6b00} .b-lost{background:#fbe9e7;color:var(--red)}
   .b-pending{background:#fff7e8;color:var(--amber)} .b-na{background:#eee;color:#777}
@@ -3701,9 +3704,7 @@ HTML = r"""<!DOCTYPE html>
 
     <div class="card" id="rsConfig" style="display:none">
       <h3><span class="step-no">2</span>Indiquer le(s) Volume Group(s) restauré(s)</h3>
-      <p class="sub">Deux options par volume : <b>orchestrer depuis HYCU</b> (si HYCU est connecté — déclenche le
-        clone/restore et récupère la <b>référence du VG (UUID)</b> automatiquement), ou <b>coller l'UUID du VG</b>
-        manuellement après l'avoir restauré/cloné dans l'UI HYCU. Le volumeHandle est dérivé automatiquement.</p>
+      <div id="rsFlowGuide" class="rsGuide"></div>
       <div id="rsVolCfgs"></div>
       <div id="rsInplaceRunWrap" style="display:none;margin-top:14px;border-top:1px solid var(--line);padding-top:12px">
         <b style="font-size:13px">Restauration sur place orchestrée</b>
@@ -3713,9 +3714,12 @@ HTML = r"""<!DOCTYPE html>
         <span class="hint" id="rsInplaceHint" style="margin:0"></span>
         <div id="rsInplaceLog"></div>
       </div>
-      <div style="margin-top:14px">
-        <button class="btn ghost" id="rsPreview">Prévisualiser le plan <span class="hint">(flux manuel — réf. VG)</span></button>
-      </div>
+      <details id="rsManualAdv" class="rsAdv rsManualPlain" open style="margin-top:14px">
+        <summary class="rsAdvSum">Flux manuel (avancé) — si vous avez déjà restauré/cloné le VG dans HYCU vous-même</summary>
+        <div style="margin-top:8px">
+          <button class="btn ghost" id="rsPreview">Prévisualiser le plan <span class="hint">(réf. VG)</span></button>
+        </div>
+      </details>
       <div id="rsErr"></div>
     </div>
 
@@ -4362,6 +4366,26 @@ function rebuildVolCfgs(){
   // Bouton global d'orchestration sur place (mode inplace + HYCU)
   $("#rsInplaceRunWrap").style.display = (hyOn && state.mode==="inplace")? "block":"none";
   if(hyOn && state.mode==="inplace") updateInplaceRunBtn();
+
+  // Flux manuel : action principale en clone (ou sur place sans HYCU) ; replié en
+  // « avancé » quand l'orchestration HYCU sur place est disponible (recommandée).
+  const manualAdv=$("#rsManualAdv");
+  if(hyOn && state.mode==="inplace"){ manualAdv.classList.remove("rsManualPlain"); manualAdv.open=false; }
+  else { manualAdv.classList.add("rsManualPlain"); manualAdv.open=true; }
+
+  // Guide de flux adapté au choix (type de restore + HYCU connecté).
+  let guide;
+  if(state.mode==="inplace"){
+    guide = hyOn
+      ? "<b>Restauration sur place (recommandé) :</b> sur chaque volume, cliquez « Point de restauration HYCU » et choisissez le point, puis « <b>Lancer la restauration sur place</b> » ci-dessous. <span class='hint'>Aucune référence à saisir.</span>"
+      : "<b>Restauration sur place — flux manuel :</b> restaurez le VG dans HYCU, renseignez la référence du VG (UUID) par volume, puis « <b>Prévisualiser le plan</b> ». <span class='hint'>Connectez HYCU pour le flux orchestré.</span>";
+  } else {
+    const sub = isCloneApp()? "Cloner l'application" : "Rattacher à l'app existante";
+    guide = hyOn
+      ? ("<b>Clone — "+sub+" (recommandé) :</b> sur chaque volume, cliquez « ⚙ Orchestrer depuis HYCU (clone) » pour créer le clone et <b>récupérer la référence du VG</b>, puis « <b>Prévisualiser le plan</b> » → « Lancer la restauration (réel) ».")
+      : ("<b>Clone — "+sub+" — flux manuel :</b> clonez le VG dans HYCU, renseignez la référence du VG (UUID) par volume, puis « <b>Prévisualiser le plan</b> » → « Lancer la restauration (réel) ». <span class='hint'>Connectez HYCU pour récupérer la référence automatiquement.</span>");
+  }
+  $("#rsFlowGuide").innerHTML = guide;
 }
 let rsHyMatch=null;   // cache de la correspondance PVC↔VG HYCU pour le namespace courant
 async function openHyOrch(pvc){
@@ -4597,7 +4621,8 @@ function updateGoButton(ready){
   $("#rsGoHint").textContent = live? "Mode réel : ces opérations seront exécutées sur le cluster."
      : "Mode simulation : rien ne sera modifié.";
   $("#rsGo").className = live? "btn danger" : "btn";
-  $("#rsGo").textContent = live? "Lancer la restauration (réel)" : "Simuler la restauration";
+  const act = state.mode==="clone" ? "le clone" : "la restauration sur place (flux manuel)";
+  $("#rsGo").textContent = (live? "Lancer " : "Simuler ") + act + (live? " (réel)" : "");
   $("#rsGo").disabled = !ready;
 }
 $("#dry").addEventListener("change",()=>{ if($("#rsPlan").style.display!=="none") updateGoButton(!$("#rsGo").disabled); });
