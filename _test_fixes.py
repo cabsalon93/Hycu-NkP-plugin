@@ -113,6 +113,32 @@ check(any(x["ns"] == "vide" and x.get("skipped") for x in _rall["results"]),
 check(_rall["filtered"] is True, "indique qu'un filtre est actif")
 H.action_namespaces, H.action_backup = _ns_orig, _bk_orig
 
+print("\n== Serveur HTTP : coupure client ignorée proprement (WinError 10053) ==")
+class _OkWfile:
+    def __init__(self): self.data = b""
+    def write(self, b): self.data += b
+class _OkHandler:
+    def __init__(self): self.wfile = _OkWfile()
+    def send_response(self, *a): pass
+    def send_header(self, *a): pass
+    def end_headers(self): pass
+oh = _OkHandler()
+H.Handler._send(oh, 200, '{"ok":true}')
+check(oh.wfile.data == b'{"ok":true}', "connexion OK -> le corps est bien écrit (chemin normal inchangé)")
+
+class _DeadWfile:
+    def write(self, b): raise ConnectionAbortedError(10053, "client gone")
+class _DeadHandler:
+    def __init__(self): self.wfile = _DeadWfile()
+    def send_response(self, *a): pass
+    def send_header(self, *a): pass
+    def end_headers(self): raise ConnectionAbortedError(10053, "client gone")
+try:
+    H.Handler._send(_DeadHandler(), 200, '{"ok":true}')
+    check(True, "connexion coupée (end_headers/write) -> _send n'explose pas (plus de traceback)")
+except Exception as e:
+    check(False, "_send a propagé %r" % e)
+
 # --- Restauration de l'état global --------------------------------------------
 for k, v in _ORIG.items():
     setattr(H, k, v)

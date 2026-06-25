@@ -177,7 +177,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1008"
+VERSION = "20260625-1021"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -3049,17 +3049,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _send(self, code, body, ctype="application/json"):
         data = body.encode("utf-8") if isinstance(body, str) else body
-        self.send_response(code)
-        self.send_header("Content-Type", ctype + "; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        # Empêche le navigateur de servir une ancienne version en cache.
-        self.send_header("Cache-Control", "no-store, must-revalidate")
-        self.send_header("Pragma", "no-cache")
-        self.end_headers()
         try:
-            self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # Empêche le navigateur de servir une ancienne version en cache.
+            self.send_header("Cache-Control", "no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.end_headers()           # flush des en-têtes (écrit sur le socket)
+            self.wfile.write(data)        # corps de la réponse
+        except ConnectionError:
+            # Le client a fermé la connexion avant la fin de la réponse (rafraîchissement,
+            # navigation, requête annulée par le navigateur/une extension…). Il n'y a plus
+            # rien à envoyer : on ignore proprement, au lieu de laisser un traceback
+            # ConnectionAbortedError [WinError 10053] / BrokenPipe / ConnectionReset polluer
+            # la console (sans incidence sur le serveur, qui continue de tourner).
             pass
 
     def _json(self, obj, code=200):
