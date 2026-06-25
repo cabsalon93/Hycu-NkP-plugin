@@ -2,9 +2,12 @@ name: build-image
 
 # Construit l'image (multi-arch) et la pousse sur ghcr.io sur tag `v*`,
 # + produit un tarball `docker save` (artefact) pour les sites isolés.
+# Déclenché aussi sur push de la branche de dev (pré-merge), car ce sandbox
+# n'autorise pas le push de tags — on retirera ce déclencheur avant le merge.
 on:
   push:
     tags: ["v*"]
+    branches: ["claude/docker-k8s"]
   workflow_dispatch:
 
 permissions:
@@ -30,7 +33,9 @@ jobs:
         id: meta
         run: |
           echo "img=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
-          echo "tag=${GITHUB_REF_NAME:-manual}" >> "$GITHUB_OUTPUT"
+          ref="${GITHUB_REF_NAME:-manual}"
+          ref="${ref//\//-}"   # un ref de branche peut contenir « / », interdit dans un tag Docker
+          echo "tag=${ref}" >> "$GITHUB_OUTPUT"
 
       - name: Build & push (amd64 + arm64)
         uses: docker/build-push-action@v6
