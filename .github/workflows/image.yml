@@ -1,13 +1,13 @@
 name: build-image
 
-# Construit l'image (multi-arch) et la pousse sur ghcr.io sur tag `v*`,
-# + produit un tarball `docker save` (artefact) pour les sites isolés.
-# Déclenché aussi sur push de la branche de dev (pré-merge), car ce sandbox
-# n'autorise pas le push de tags — on retirera ce déclencheur avant le merge.
+# Construit l'image (multi-arch) et la pousse sur ghcr.io :
+#  - push / merge dans `main`            -> reconstruit :latest (+ :main)
+#  - tag `vX.Y.Z`                        -> image versionnée :vX.Y.Z + tarball air-gap
+#  - « Run workflow » (workflow_dispatch) -> build à la demande sur n'importe quelle branche
 on:
   push:
+    branches: ["main"]
     tags: ["v*"]
-    branches: ["claude/docker-k8s"]
   workflow_dispatch:
 
 permissions:
