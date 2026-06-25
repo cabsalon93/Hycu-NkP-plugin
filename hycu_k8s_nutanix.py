@@ -177,7 +177,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1003"
+VERSION = "20260625-1008"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -808,6 +808,34 @@ def action_backup(ns):
     audit("backup", namespace=ns, dir=d, count=len(items))
     return {"ok": True, "error": None, "dir": d, "count": len(items),
             "files": files, "volumes": index["volumes"]}
+
+
+def action_backup_all():
+    """Sauvegarde la config (PV/PVC) de TOUS les namespaces autorisés par le filtre
+    courant (tous les namespaces du cluster si aucun filtre). Un namespace sans PVC est
+    « ignoré » (pas une erreur). Renvoie un récapitulatif par namespace + des totaux."""
+    info = action_namespaces()
+    if not info.get("ok"):
+        return {"ok": False, "error": info.get("error") or "Liste des namespaces indisponible.",
+                "results": []}
+    namespaces = info.get("namespaces") or []
+    if not namespaces:
+        return {"ok": False, "error": "Aucun namespace à sauvegarder.", "results": []}
+    results, backed_up, vol_total = [], 0, 0
+    for ns in namespaces:
+        b = action_backup(ns)
+        if b.get("ok"):
+            backed_up += 1
+            vol_total += b.get("count", 0)
+            results.append({"ns": ns, "ok": True, "count": b.get("count", 0), "dir": b.get("dir")})
+        else:
+            err = b.get("error") or ""
+            results.append({"ns": ns, "ok": False, "skipped": "Aucun PVC" in err,
+                            "count": 0, "error": err})
+    audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total)
+    return {"ok": True, "error": None, "results": results,
+            "namespaces": len(namespaces), "backed_up": backed_up, "volumes": vol_total,
+            "filtered": bool(CONFIG.get("namespace_filter"))}
 
 
 # ------------------------------------------------------------------------------
@@ -3122,6 +3150,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path == "/api/backup":
                 return self._json(action_backup(payload.get("ns", "")))
+            if path == "/api/backup_all":
+                return self._json(action_backup_all())
             if path == "/api/prepare_restore":
                 return self._json(action_prepare_restore(payload))
             if path == "/api/execute_restore":
@@ -3535,6 +3565,7 @@ HTML = r"""<!DOCTYPE html>
         <div><select id="bkNs"></select></div>
         <div style="flex:none"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
         <div style="flex:none"><button class="btn" id="bkRun">Sauvegarder ce namespace</button></div>
+        <div style="flex:none"><button class="btn ghost" id="bkRunAll" title="Sauvegarder tous les namespaces autorisés par le filtre (tous si aucun filtre)">Sauvegarder tous (filtrés)</button></div>
       </div>
       <div id="bkOut"></div>
     </div>
@@ -4080,6 +4111,22 @@ $("#bkRun").onclick=async()=>{
   $("#bkOut").innerHTML=`<div class="note">${r.count} volume(s) sauvegardé(s) dans
      <code>${esc(r.dir)}</code></div><ul class="pvc-list" style="margin-top:10px">${rows}</ul>
      <div class="warnbox">⚠ Copiez ce dossier <b>hors du cluster</b> (autre stockage) : c'est votre filet de sécurité en cas de sinistre.</div>`;
+};
+$("#bkRunAll").onclick=async()=>{
+  const b=$("#bkRunAll");
+  b.disabled=true; b.innerHTML='<span class="spin"></span>Sauvegarde…';
+  const r=await post("/api/backup_all",{});
+  b.disabled=false; b.textContent="Sauvegarder tous (filtrés)";
+  if(!r.ok){$("#bkOut").innerHTML=errBox(r.error);return;}
+  const rows=(r.results||[]).map(x=>{
+    if(x.ok) return `<li class="logline"><span class="ic ok">✓</span><span><b>${esc(x.ns)}</b> — ${x.count} volume(s) → <code>${esc(x.dir)}</code></span></li>`;
+    if(x.skipped) return `<li class="logline"><span class="ic sim">○</span><span><b>${esc(x.ns)}</b> — aucun PVC (ignoré)</span></li>`;
+    return `<li class="logline"><span class="ic ko">✕</span><span><b>${esc(x.ns)}</b> — ${esc(x.error||'échec')}</span></li>`;
+  }).join("");
+  const scope = r.filtered? "namespaces du filtre" : "tous les namespaces du cluster";
+  $("#bkOut").innerHTML=`<div class="note">${r.backed_up}/${r.namespaces} namespace(s) sauvegardé(s) · ${r.volumes} volume(s) au total <span class="hint">(${scope})</span>.</div>
+     <ul class="pvc-list" style="margin-top:10px">${rows}</ul>
+     <div class="warnbox">⚠ Copiez ces dossiers <b>hors du cluster</b> : c'est votre filet de sécurité en cas de sinistre.</div>`;
 };
 
 // --------- Protection HYCU (assigner politique + sauvegarder) ---------

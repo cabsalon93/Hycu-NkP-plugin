@@ -97,6 +97,22 @@ check(H._hycu_job_id({"jobUuid": "jid"}) == "jid", "dict simple -> jobUuid")
 check(isinstance(H._hycu_first({"entities": ["s"]}), dict), "_hycu_first renvoie toujours un dict")
 check(H._hycu_job_id({}) is None and H._hycu_job_id({"entities": []}) is None, "absence d'ID -> None (pas d'erreur)")
 
+print("\n== Sauvegarde de TOUS les namespaces filtrés (nouvelle fonctionnalité) ==")
+_ns_orig, _bk_orig = H.action_namespaces, H.action_backup
+H.action_namespaces = lambda: {"ok": True, "namespaces": ["wordpress", "vide", "shop"], "error": None}
+def _fake_bk(ns):
+    if ns == "vide":
+        return {"ok": False, "error": "Aucun PVC trouvé dans le namespace 'vide'."}
+    return {"ok": True, "dir": "/b/" + ns, "count": 2 if ns == "wordpress" else 3}
+H.action_backup = _fake_bk
+H.CONFIG["namespace_filter"] = ["wordpress", "vide", "shop"]
+_rall = H.action_backup_all()
+check(_rall["ok"] and _rall["backed_up"] == 2 and _rall["volumes"] == 5, "agrège 2 ns sauvegardés / 5 volumes")
+check(any(x["ns"] == "vide" and x.get("skipped") for x in _rall["results"]),
+      "namespace sans PVC -> ignoré (pas une erreur)")
+check(_rall["filtered"] is True, "indique qu'un filtre est actif")
+H.action_namespaces, H.action_backup = _ns_orig, _bk_orig
+
 # --- Restauration de l'état global --------------------------------------------
 for k, v in _ORIG.items():
     setattr(H, k, v)
