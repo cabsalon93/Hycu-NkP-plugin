@@ -177,7 +177,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260625-1100"
+VERSION = "20260625-1130"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -1202,7 +1202,7 @@ def _prepare_one(ns, item, mode, backup_path, backup_root=None):
     if built["looks_like_vg_name"]:
         warn = ("L'UUID fourni correspond au NOM du VG (« pvc-<uuid> », = UUID du PVC) et non à l'UUID "
                 "du Volume Group. Vous avez probablement saisi le nom du VG au lieu de son UUID — "
-                "utilisez « Réf. VG auto » ou copiez l'UUID du VG (suffixe de NutanixVolumes-… / ntnx-k8s-…).")
+                "utilisez « Rechercher le VG dans Prism » ou copiez l'UUID du VG (suffixe de NutanixVolumes-… / ntnx-k8s-…).")
     elif mode == "clone" and built["same_uuid"]:
         warn = ("L'UUID est identique à l'ancien : le clone n'a peut-être pas produit de nouveau VG "
                 "(UUID du VG source saisi au lieu du VG cloné ?).")
@@ -3429,6 +3429,9 @@ HTML = r"""<!DOCTYPE html>
   .pvc-list .meta{font-size:11px;color:var(--muted)}
   .vol-cfg{border:1px solid var(--line);border-radius:8px;padding:12px;margin:8px 0;background:#fff}
   .vol-cfg.disabled{opacity:.5}
+  .rsAdv{margin-top:8px;border:1px solid var(--line);border-radius:8px;background:#faf9fc;padding:6px 10px}
+  .rsAdvSum{cursor:pointer;font-weight:600;font-size:13px;color:#5a4b86;user-select:none}
+  .rsAdv[open] .rsAdvSum{margin-bottom:8px}
   .badge{font-size:10px;padding:2px 8px;border-radius:20px;text-transform:uppercase;letter-spacing:.5px}
   .b-bound{background:#eefcc4;color:#4f6b00} .b-lost{background:#fbe9e7;color:var(--red)}
   .b-pending{background:#fff7e8;color:var(--amber)} .b-na{background:#eee;color:#777}
@@ -4336,7 +4339,7 @@ function rebuildVolCfgs(){
       ? `<label class="fld">Nom du nouveau PV (modifiable)</label>
          <input type="text" class="rsName" data-pvc="${esc(pvc)}" value="${esc(suggestName(pv))}">` : "";
     const ntRow = ntOn
-      ? `<button class="btn ghost ntRefBtn" data-pvc="${esc(pvc)}" style="margin-top:6px">Réf. VG auto (Nutanix)</button>
+      ? `<button class="btn ghost ntRefBtn" data-pvc="${esc(pvc)}" style="margin-top:6px">Rechercher le VG dans Prism</button>
          <div class="ntpick" data-pvc="${esc(pvc)}"></div>` : "";
     const hyRow = (hyOn && state.mode==="clone")
       ? `<button class="btn ghost hyOrchBtn" data-pvc="${esc(pvc)}" style="margin-top:6px">⚙ Orchestrer depuis HYCU (clone)</button>
@@ -4344,8 +4347,12 @@ function rebuildVolCfgs(){
     const hyInpRow = (hyOn && state.mode==="inplace")
       ? `<button class="btn ghost hyInpBtn" data-pvc="${esc(pvc)}" style="margin-top:6px">Point de restauration HYCU</button>
          <div class="hyInp" data-pvc="${esc(pvc)}"></div>` : "";
-    const iqnRow = `<label class="fld">Référence du Volume Group restauré/cloné — UUID du VG ${state.mode==="inplace"?'<span class="hint">(uniquement pour le flux manuel)</span>':''}</label>
-         <textarea class="rsRef" data-pvc="${esc(pvc)}" placeholder="5b4d284b-7109-4e82-4c71-7d0e36ecb5ab  (UUID du VG, ou NutanixVolumes-&lt;uuid&gt;, ou IQN legacy)"></textarea>${ntRow}`;
+    const advOpen = hyOn ? "" : "open";   // sans orchestration HYCU, la saisie manuelle est la seule voie -> volet ouvert
+    const iqnRow = `<details class="rsAdv" ${advOpen}>
+         <summary class="rsAdvSum">Saisie manuelle / avancé — référence du Volume Group</summary>
+         <label class="fld">Référence du Volume Group restauré/cloné — UUID du VG ${state.mode==="inplace"?'<span class="hint">(uniquement pour le flux manuel)</span>':''}</label>
+         <textarea class="rsRef" data-pvc="${esc(pvc)}" placeholder="5b4d284b-7109-4e82-4c71-7d0e36ecb5ab  (UUID du VG, ou NutanixVolumes-&lt;uuid&gt;, ou IQN legacy)"></textarea>${ntRow}
+       </details>`;
     return `<div class="vol-cfg"><div class="nm">${esc(pvc)} <span class="hint">(PV ${esc(pv||'—')})</span></div>
       ${hyRow}${hyInpRow}${iqnRow}${nameRow}</div>`;
   }).join("");
@@ -4399,7 +4406,7 @@ async function hyOrchRun(pvc){
   if(!r.ok){ out.innerHTML=errBox(r.error); return; }
   if(r.dry){ out.innerHTML=`<div class="warnbox">Simulation — appel HYCU qui serait envoyé :</div><pre class="box">${esc(JSON.stringify(r.planned,null,2))}</pre>`; return; }
   out.innerHTML=`<div class="note">Job HYCU lancé : <code>${esc(r.job_id||'?')}</code></div><div class="hyOrchProg"></div>`;
-  if(!r.job_id){ out.innerHTML+='<div class="warnbox">Job HYCU non identifié — impossible de confirmer la fin du clone. Récupérez la réf. du VG via « Réf. VG auto (Nutanix) » une fois le clone terminé dans HYCU.</div>'; return; }
+  if(!r.job_id){ out.innerHTML+='<div class="warnbox">Job HYCU non identifié — impossible de confirmer la fin du clone. Récupérez la réf. du VG via « Rechercher le VG dans Prism » une fois le clone terminé dans HYCU.</div>'; return; }
   const ok=await pollJobBar(r.job_id, box.querySelector(".hyOrchProg"));
   if(!ok){ out.innerHTML+='<div class="err">Le job HYCU n\'a pas abouti — référence du VG non récupérée.</div>'; return; }
   await hyOrchFillRef(pvc, newName);   // clone : UUID du nouveau VG par nom EXACT côté Nutanix
@@ -4408,19 +4415,20 @@ async function hyOrchFillRef(pvc, vgName){
   const box=document.querySelector(`.hyOrch[data-pvc="${CSS.escape(pvc)}"]`);
   const out=box.querySelector(".hyOrchOut");
   if(!((conn.nutanix&&conn.nutanix.connected)||(conn.prismcentral&&conn.prismcentral.connected))){
-    out.innerHTML+='<div class="warnbox">Opération HYCU terminée. Connectez Nutanix (Prism) pour récupérer la réf. du VG automatiquement, sinon utilisez « Réf. VG auto (Nutanix) » ou collez l\'UUID du VG.</div>'; return;
+    out.innerHTML+='<div class="warnbox">Opération HYCU terminée. Connectez Nutanix (Prism) pour récupérer la réf. du VG automatiquement, sinon utilisez « Rechercher le VG dans Prism » ou collez l\'UUID du VG.</div>'; return;
   }
   out.innerHTML+='<div class="hint">Récupération de l\'UUID du VG cloné depuis Nutanix…</div>';
   const r=await get("/api/nutanix/vgs?q="+encodeURIComponent(vgName||""));
-  if(!r.ok || !(r.vgs||[]).length){ out.innerHTML+=`<div class="warnbox">VG « ${esc(vgName||'')} » introuvable côté Nutanix — récupérez la réf. manuellement via « Réf. VG auto (Nutanix) ».</div>`; return; }
+  if(!r.ok || !(r.vgs||[]).length){ out.innerHTML+=`<div class="warnbox">VG « ${esc(vgName||'')} » introuvable côté Nutanix — récupérez la réf. manuellement via « Rechercher le VG dans Prism ».</div>`; return; }
   // Égalité EXACTE du nom : ne jamais deviner (un mauvais VG = mauvais volume attaché).
   const exact=r.vgs.filter(v=>(v.name||"")===vgName);
-  if(exact.length!==1){ out.innerHTML+=`<div class="warnbox">${exact.length===0?'Aucun':'Plusieurs'} VG nommé(s) exactement « ${esc(vgName||'')} » côté Nutanix — récupérez la réf. manuellement via « Réf. VG auto (Nutanix) » pour choisir le bon.</div>`; return; }
+  if(exact.length!==1){ out.innerHTML+=`<div class="warnbox">${exact.length===0?'Aucun':'Plusieurs'} VG nommé(s) exactement « ${esc(vgName||'')} » côté Nutanix — récupérez la réf. manuellement via « Rechercher le VG dans Prism » pour choisir le bon.</div>`; return; }
   let vg=exact[0];
   // NKP moderne : l'UUID du VG est la référence (= suffixe du volumeHandle). Pas d'IQN requis.
   let ref=vg.uuid;
   if(!ref){ out.innerHTML+='<div class="warnbox">VG trouvé mais UUID non exposé — récupérez la réf. manuellement.</div>'; return; }
-  const ta=document.querySelector(`.rsRef[data-pvc="${CSS.escape(pvc)}"]`); if(ta) ta.value=ref;
+  const ta=document.querySelector(`.rsRef[data-pvc="${CSS.escape(pvc)}"]`);
+  if(ta){ ta.value=ref; const d=ta.closest("details.rsAdv"); if(d) d.open=true; }   // déplier pour montrer la réf remplie
   out.innerHTML+=`<div class="note">Référence du VG (UUID <code>${esc(ref)}</code>) remplie automatiquement depuis « ${esc(vg.name||'')} ». Cliquez « Prévisualiser le plan ».</div>`;
 }
 // --------- Orchestration RESTAURATION SUR PLACE (arrêt -> restore in-place -> redémarrage) ---------
