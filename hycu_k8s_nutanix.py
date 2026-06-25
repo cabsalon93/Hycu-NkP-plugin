@@ -177,7 +177,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260624-1602"
+VERSION = "20260625-1021"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -808,6 +808,34 @@ def action_backup(ns):
     audit("backup", namespace=ns, dir=d, count=len(items))
     return {"ok": True, "error": None, "dir": d, "count": len(items),
             "files": files, "volumes": index["volumes"]}
+
+
+def action_backup_all():
+    """Sauvegarde la config (PV/PVC) de TOUS les namespaces autorisés par le filtre
+    courant (tous les namespaces du cluster si aucun filtre). Un namespace sans PVC est
+    « ignoré » (pas une erreur). Renvoie un récapitulatif par namespace + des totaux."""
+    info = action_namespaces()
+    if not info.get("ok"):
+        return {"ok": False, "error": info.get("error") or "Liste des namespaces indisponible.",
+                "results": []}
+    namespaces = info.get("namespaces") or []
+    if not namespaces:
+        return {"ok": False, "error": "Aucun namespace à sauvegarder.", "results": []}
+    results, backed_up, vol_total = [], 0, 0
+    for ns in namespaces:
+        b = action_backup(ns)
+        if b.get("ok"):
+            backed_up += 1
+            vol_total += b.get("count", 0)
+            results.append({"ns": ns, "ok": True, "count": b.get("count", 0), "dir": b.get("dir")})
+        else:
+            err = b.get("error") or ""
+            results.append({"ns": ns, "ok": False, "skipped": "Aucun PVC" in err,
+                            "count": 0, "error": err})
+    audit("backup_all", namespaces=len(namespaces), backed_up=backed_up, volumes=vol_total)
+    return {"ok": True, "error": None, "results": results,
+            "namespaces": len(namespaces), "backed_up": backed_up, "volumes": vol_total,
+            "filtered": bool(CONFIG.get("namespace_filter"))}
 
 
 # ------------------------------------------------------------------------------
@@ -2160,16 +2188,30 @@ def _hycu_items(data):
 
 
 def _hycu_first(j):
-    """Premier objet utile d'une réponse HYCU : `entities[0]` si liste, sinon le dict."""
-    ents = j.get("entities") if isinstance(j, dict) else None
-    if isinstance(ents, list) and ents:
-        return ents[0]
-    return j if isinstance(j, dict) else {}
+    """Premier OBJET (dict) utile d'une réponse HYCU : `entities[0]` si c'est un dict,
+    sinon le dict `j`. Renvoie TOUJOURS un dict : certains endpoints renvoient des
+    `entities` = listes de chaînes (UUID), qu'on ne déréférence pas par clé."""
+    if isinstance(j, dict):
+        ents = j.get("entities")
+        if isinstance(ents, list):
+            for e in ents:
+                if isinstance(e, dict):
+                    return e
+        return j
+    return {}
 
 
 def _hycu_job_id(j):
-    """Identifiant de job/tâche d'une réponse HYCU (clés variables selon l'endpoint)."""
-    o = _hycu_first(j)
+    """Identifiant de job/tâche d'une réponse HYCU (format variable selon l'endpoint).
+    Tolère : une réponse = chaîne (UUID nu), ou `entities`/racine = liste de chaînes
+    (ex. /schedules/backupVolumeGroup renvoie des UUID de tâches), ou un objet dict."""
+    if isinstance(j, str):
+        return j or None
+    seq = j.get("entities") if isinstance(j, dict) else (j if isinstance(j, list) else None)
+    for e in (seq or []):
+        if isinstance(e, str) and e:                 # entities = liste d'UUID (chaînes)
+            return e
+    o = _hycu_first(j)                                # entities = liste d'objets
     return (o.get("uuid") or o.get("jobUuid") or o.get("restoreManagedTaskUuid")
             or (o.get("metadata") or {}).get("jobUuid"))
 
@@ -2189,6 +2231,8 @@ def _hycu_list_vgs():
         items = _hycu_items(data)
         fresh = 0                           # dédup par uuid : robuste si l'API ignore l'offset
         for it in items:
+            if not isinstance(it, dict):    # certains endpoints renvoient des entités = chaînes
+                continue
             uid = it.get("uuid") or it.get("externalId") or it.get("name")
             if uid in seen:
                 continue
@@ -2350,6 +2394,8 @@ def action_hycu_match(ns):
     # Index sensibles aux collisions (listes), UUID normalisé via UUID_RE.
     by_ext, by_name = {}, {}
     for vg in items:
+        if not isinstance(vg, dict):
+            continue
         m = UUID_RE.search(vg.get("externalId") or "")
         if m:
             by_ext.setdefault(m.group(0).lower(), []).append(vg)
@@ -3003,17 +3049,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def _send(self, code, body, ctype="application/json"):
         data = body.encode("utf-8") if isinstance(body, str) else body
-        self.send_response(code)
-        self.send_header("Content-Type", ctype + "; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        # Empêche le navigateur de servir une ancienne version en cache.
-        self.send_header("Cache-Control", "no-store, must-revalidate")
-        self.send_header("Pragma", "no-cache")
-        self.end_headers()
         try:
-            self.wfile.write(data)
-        except (BrokenPipeError, ConnectionResetError):
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            # Empêche le navigateur de servir une ancienne version en cache.
+            self.send_header("Cache-Control", "no-store, must-revalidate")
+            self.send_header("Pragma", "no-cache")
+            self.end_headers()           # flush des en-têtes (écrit sur le socket)
+            self.wfile.write(data)        # corps de la réponse
+        except ConnectionError:
+            # Le client a fermé la connexion avant la fin de la réponse (rafraîchissement,
+            # navigation, requête annulée par le navigateur/une extension…). Il n'y a plus
+            # rien à envoyer : on ignore proprement, au lieu de laisser un traceback
+            # ConnectionAbortedError [WinError 10053] / BrokenPipe / ConnectionReset polluer
+            # la console (sans incidence sur le serveur, qui continue de tourner).
             pass
 
     def _json(self, obj, code=200):
@@ -3104,6 +3155,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         try:
             if path == "/api/backup":
                 return self._json(action_backup(payload.get("ns", "")))
+            if path == "/api/backup_all":
+                return self._json(action_backup_all())
             if path == "/api/prepare_restore":
                 return self._json(action_prepare_restore(payload))
             if path == "/api/execute_restore":
@@ -3517,6 +3570,7 @@ HTML = r"""<!DOCTYPE html>
         <div><select id="bkNs"></select></div>
         <div style="flex:none"><button class="btn ghost nsEdit" title="Filtrer la liste des namespaces">✎ Filtrer</button></div>
         <div style="flex:none"><button class="btn" id="bkRun">Sauvegarder ce namespace</button></div>
+        <div style="flex:none"><button class="btn ghost" id="bkRunAll" title="Sauvegarder tous les namespaces autorisés par le filtre (tous si aucun filtre)">Sauvegarder tous (filtrés)</button></div>
       </div>
       <div id="bkOut"></div>
     </div>
@@ -4062,6 +4116,22 @@ $("#bkRun").onclick=async()=>{
   $("#bkOut").innerHTML=`<div class="note">${r.count} volume(s) sauvegardé(s) dans
      <code>${esc(r.dir)}</code></div><ul class="pvc-list" style="margin-top:10px">${rows}</ul>
      <div class="warnbox">⚠ Copiez ce dossier <b>hors du cluster</b> (autre stockage) : c'est votre filet de sécurité en cas de sinistre.</div>`;
+};
+$("#bkRunAll").onclick=async()=>{
+  const b=$("#bkRunAll");
+  b.disabled=true; b.innerHTML='<span class="spin"></span>Sauvegarde…';
+  const r=await post("/api/backup_all",{});
+  b.disabled=false; b.textContent="Sauvegarder tous (filtrés)";
+  if(!r.ok){$("#bkOut").innerHTML=errBox(r.error);return;}
+  const rows=(r.results||[]).map(x=>{
+    if(x.ok) return `<li class="logline"><span class="ic ok">✓</span><span><b>${esc(x.ns)}</b> — ${x.count} volume(s) → <code>${esc(x.dir)}</code></span></li>`;
+    if(x.skipped) return `<li class="logline"><span class="ic sim">○</span><span><b>${esc(x.ns)}</b> — aucun PVC (ignoré)</span></li>`;
+    return `<li class="logline"><span class="ic ko">✕</span><span><b>${esc(x.ns)}</b> — ${esc(x.error||'échec')}</span></li>`;
+  }).join("");
+  const scope = r.filtered? "namespaces du filtre" : "tous les namespaces du cluster";
+  $("#bkOut").innerHTML=`<div class="note">${r.backed_up}/${r.namespaces} namespace(s) sauvegardé(s) · ${r.volumes} volume(s) au total <span class="hint">(${scope})</span>.</div>
+     <ul class="pvc-list" style="margin-top:10px">${rows}</ul>
+     <div class="warnbox">⚠ Copiez ces dossiers <b>hors du cluster</b> : c'est votre filet de sécurité en cas de sinistre.</div>`;
 };
 
 // --------- Protection HYCU (assigner politique + sauvegarder) ---------

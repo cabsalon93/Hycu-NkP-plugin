@@ -85,6 +85,60 @@ H._rest_raw = lambda system, method, path, body=None, timeout=30: {
     "ok": True, "json": {"data": [{"extId": "zzz"}, {"extId": "aaa"}, {"extId": "mmm"}]}}
 check(H._clone_vg_disk_uuids("vg") == "aaa,mmm,zzz", "extId triés indépendamment de l'ordre renvoyé")
 
+print("\n== HYCU : parsing de l'ID de job tolérant aux chaînes (bug protect 500) ==")
+# /schedules/backupVolumeGroup renvoie des UUID de tâches en CHAÎNES : ne doit plus
+# planter avec 'str' object has no attribute 'get'.
+check(H._hycu_job_id({"entities": ["task-uuid-123"]}) == "task-uuid-123",
+      "entities = liste de chaînes -> 1er UUID (plus de 'str'.get)")
+check(H._hycu_job_id("bare-uuid") == "bare-uuid", "réponse = chaîne nue -> renvoyée")
+check(H._hycu_job_id(["uuid-a", "uuid-b"]) == "uuid-a", "racine = liste de chaînes -> 1er")
+check(H._hycu_job_id({"entities": [{"uuid": "obj-uuid"}]}) == "obj-uuid", "entities = objets -> uuid")
+check(H._hycu_job_id({"jobUuid": "jid"}) == "jid", "dict simple -> jobUuid")
+check(isinstance(H._hycu_first({"entities": ["s"]}), dict), "_hycu_first renvoie toujours un dict")
+check(H._hycu_job_id({}) is None and H._hycu_job_id({"entities": []}) is None, "absence d'ID -> None (pas d'erreur)")
+
+print("\n== Sauvegarde de TOUS les namespaces filtrés (nouvelle fonctionnalité) ==")
+_ns_orig, _bk_orig = H.action_namespaces, H.action_backup
+H.action_namespaces = lambda: {"ok": True, "namespaces": ["wordpress", "vide", "shop"], "error": None}
+def _fake_bk(ns):
+    if ns == "vide":
+        return {"ok": False, "error": "Aucun PVC trouvé dans le namespace 'vide'."}
+    return {"ok": True, "dir": "/b/" + ns, "count": 2 if ns == "wordpress" else 3}
+H.action_backup = _fake_bk
+H.CONFIG["namespace_filter"] = ["wordpress", "vide", "shop"]
+_rall = H.action_backup_all()
+check(_rall["ok"] and _rall["backed_up"] == 2 and _rall["volumes"] == 5, "agrège 2 ns sauvegardés / 5 volumes")
+check(any(x["ns"] == "vide" and x.get("skipped") for x in _rall["results"]),
+      "namespace sans PVC -> ignoré (pas une erreur)")
+check(_rall["filtered"] is True, "indique qu'un filtre est actif")
+H.action_namespaces, H.action_backup = _ns_orig, _bk_orig
+
+print("\n== Serveur HTTP : coupure client ignorée proprement (WinError 10053) ==")
+class _OkWfile:
+    def __init__(self): self.data = b""
+    def write(self, b): self.data += b
+class _OkHandler:
+    def __init__(self): self.wfile = _OkWfile()
+    def send_response(self, *a): pass
+    def send_header(self, *a): pass
+    def end_headers(self): pass
+oh = _OkHandler()
+H.Handler._send(oh, 200, '{"ok":true}')
+check(oh.wfile.data == b'{"ok":true}', "connexion OK -> le corps est bien écrit (chemin normal inchangé)")
+
+class _DeadWfile:
+    def write(self, b): raise ConnectionAbortedError(10053, "client gone")
+class _DeadHandler:
+    def __init__(self): self.wfile = _DeadWfile()
+    def send_response(self, *a): pass
+    def send_header(self, *a): pass
+    def end_headers(self): raise ConnectionAbortedError(10053, "client gone")
+try:
+    H.Handler._send(_DeadHandler(), 200, '{"ok":true}')
+    check(True, "connexion coupée (end_headers/write) -> _send n'explose pas (plus de traceback)")
+except Exception as e:
+    check(False, "_send a propagé %r" % e)
+
 # --- Restauration de l'état global --------------------------------------------
 for k, v in _ORIG.items():
     setattr(H, k, v)
