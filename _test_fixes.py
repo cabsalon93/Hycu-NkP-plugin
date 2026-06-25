@@ -85,6 +85,18 @@ H._rest_raw = lambda system, method, path, body=None, timeout=30: {
     "ok": True, "json": {"data": [{"extId": "zzz"}, {"extId": "aaa"}, {"extId": "mmm"}]}}
 check(H._clone_vg_disk_uuids("vg") == "aaa,mmm,zzz", "extId triés indépendamment de l'ordre renvoyé")
 
+print("\n== HYCU : parsing de l'ID de job tolérant aux chaînes (bug protect 500) ==")
+# /schedules/backupVolumeGroup renvoie des UUID de tâches en CHAÎNES : ne doit plus
+# planter avec 'str' object has no attribute 'get'.
+check(H._hycu_job_id({"entities": ["task-uuid-123"]}) == "task-uuid-123",
+      "entities = liste de chaînes -> 1er UUID (plus de 'str'.get)")
+check(H._hycu_job_id("bare-uuid") == "bare-uuid", "réponse = chaîne nue -> renvoyée")
+check(H._hycu_job_id(["uuid-a", "uuid-b"]) == "uuid-a", "racine = liste de chaînes -> 1er")
+check(H._hycu_job_id({"entities": [{"uuid": "obj-uuid"}]}) == "obj-uuid", "entities = objets -> uuid")
+check(H._hycu_job_id({"jobUuid": "jid"}) == "jid", "dict simple -> jobUuid")
+check(isinstance(H._hycu_first({"entities": ["s"]}), dict), "_hycu_first renvoie toujours un dict")
+check(H._hycu_job_id({}) is None and H._hycu_job_id({"entities": []}) is None, "absence d'ID -> None (pas d'erreur)")
+
 # --- Restauration de l'état global --------------------------------------------
 for k, v in _ORIG.items():
     setattr(H, k, v)

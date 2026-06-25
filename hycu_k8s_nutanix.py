@@ -177,7 +177,7 @@ def save_config(updates):
 
 # Version horodatée de la build (format AAAAMMJJ-HHMM). À incrémenter à chaque
 # changement notable du programme ; affichée dans l'en-tête de l'interface.
-VERSION = "20260624-1602"
+VERSION = "20260625-1003"
 
 # Jeton anti-CSRF généré au démarrage, injecté dans la page et exigé sur les POST.
 CSRF_TOKEN = secrets.token_urlsafe(32)
@@ -2160,16 +2160,30 @@ def _hycu_items(data):
 
 
 def _hycu_first(j):
-    """Premier objet utile d'une réponse HYCU : `entities[0]` si liste, sinon le dict."""
-    ents = j.get("entities") if isinstance(j, dict) else None
-    if isinstance(ents, list) and ents:
-        return ents[0]
-    return j if isinstance(j, dict) else {}
+    """Premier OBJET (dict) utile d'une réponse HYCU : `entities[0]` si c'est un dict,
+    sinon le dict `j`. Renvoie TOUJOURS un dict : certains endpoints renvoient des
+    `entities` = listes de chaînes (UUID), qu'on ne déréférence pas par clé."""
+    if isinstance(j, dict):
+        ents = j.get("entities")
+        if isinstance(ents, list):
+            for e in ents:
+                if isinstance(e, dict):
+                    return e
+        return j
+    return {}
 
 
 def _hycu_job_id(j):
-    """Identifiant de job/tâche d'une réponse HYCU (clés variables selon l'endpoint)."""
-    o = _hycu_first(j)
+    """Identifiant de job/tâche d'une réponse HYCU (format variable selon l'endpoint).
+    Tolère : une réponse = chaîne (UUID nu), ou `entities`/racine = liste de chaînes
+    (ex. /schedules/backupVolumeGroup renvoie des UUID de tâches), ou un objet dict."""
+    if isinstance(j, str):
+        return j or None
+    seq = j.get("entities") if isinstance(j, dict) else (j if isinstance(j, list) else None)
+    for e in (seq or []):
+        if isinstance(e, str) and e:                 # entities = liste d'UUID (chaînes)
+            return e
+    o = _hycu_first(j)                                # entities = liste d'objets
     return (o.get("uuid") or o.get("jobUuid") or o.get("restoreManagedTaskUuid")
             or (o.get("metadata") or {}).get("jobUuid"))
 
@@ -2189,6 +2203,8 @@ def _hycu_list_vgs():
         items = _hycu_items(data)
         fresh = 0                           # dédup par uuid : robuste si l'API ignore l'offset
         for it in items:
+            if not isinstance(it, dict):    # certains endpoints renvoient des entités = chaînes
+                continue
             uid = it.get("uuid") or it.get("externalId") or it.get("name")
             if uid in seen:
                 continue
@@ -2350,6 +2366,8 @@ def action_hycu_match(ns):
     # Index sensibles aux collisions (listes), UUID normalisé via UUID_RE.
     by_ext, by_name = {}, {}
     for vg in items:
+        if not isinstance(vg, dict):
+            continue
         m = UUID_RE.search(vg.get("externalId") or "")
         if m:
             by_ext.setdefault(m.group(0).lower(), []).append(vg)
